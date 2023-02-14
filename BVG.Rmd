@@ -1,0 +1,297 @@
+---
+title: "Berliner Isochronen"
+author: "Andreas Domberg"
+output:
+  html_document:
+    code_folding: hide
+date: "2023-02-13"
+---
+
+
+
+# Wie lange dauert es, in Berlin mit den öffentlichen Verkehrsmitteln von A nach B zu kommen?
+
+Diese Frage kann etwa bei der Wohnungssuche ausschlaggebend sein, oder für alle, die wie der Autor die Intuition prüfen wollen, dass räumlich kurze Fahrten unangemessen lange dauern, während weiter entlegene Ziele für ihre Distanz wieder gut angebunden zu sein scheinen.
+Prüfen wir es also:
+Wir benutzen die API der BVG ([](https://v5.bvg.transport.rest/)), um dort wie eine Navi-App, jedoch automatisiert, Fahrten von einer von uns gewählten Station zu allen anderen Stationen des Stadtgebiets abzufragen.
+Eine Liste aller Stationen ist ([hier verfügbar](https://www.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip)), und damit können wir starten.
+
+Abgesehen von den nötigsten `library`-Imports richten wir ein paar Hilfsfunktionen ein und legen die Parameter für unsere Anfragen fest.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(mapdeck)
+
+# Startpunkt: S Treptower Park
+departure_id <- "900190001"
+
+# die Cache-Datei lässt uns unterbrochene Anfragen fortführen
+CACHE <- "cache-journey-durations"
+SEARCH_RANGE <- 25000
+STOPS_URL <- "https://www.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
+set_token("pk.eyJ1IjoiYW5kbWJnIiwiYSI6ImNsNzdrbXo0ejAwcHMzdm94bnRlNTY5YzcifQ.-zefl9Td9t-lEiP999oL7A")
+
+
+
+# unser Wrapper für die API-Anfrage; Antworten sind Listen von journeys:
+bvg_request <- function(endpoint, debug=F) {
+  url <- httr::modify_url("https://v5.bvg.transport.rest/", path = endpoint)
+  
+  response <- httr::GET(url)
+  
+  # Fehler bei der Anfrage identifizieren:
+  if ( httr::http_error(response) ){
+    message( paste( "httr: Status code", httr::status_code(response) ) )
+    message( paste( "httr: An error occurred. URL:", url ) )
+    message( jsonlite::fromJSON( httr::content( response, as = "text" ) )[2] )
+    return(NA)
+  }
+
+  if (httr::http_type(response) != "application/json") {
+    message("httr: API did not return json")
+    return(NA)
+  }
+  
+  json_text <- httr::content(response, as = "text")
+  json_list <- jsonlite::fromJSON(json_text)
+  return(json_list)
+}
+
+
+# journeys: Liste von Verbindungen aus bvg_request();
+# Ausgabe: Dauer der schnellsten Verbindung als Ganzzahl
+journey_min_duration <- function( journeys ){
+  if( sum( is.na(journeys) ) > 0 ) return(NA)
+  out <- character(0)                                   # start with empty result;
+  for( i in journeys$journeys$legs ) {                  # for each journey,
+    this_duration <- lubridate::time_length(
+      lubridate::ymd_hms( tail( i$arrival, 1) ) -
+        lubridate::ymd_hms( head( i$departure, 1) ),
+      unit = "minute")
+    out <- c( out, this_duration )
+  }
+  return( min(out) )
+}
+
+
+
+# für den Vektor an Geo-Punkten und den Umriss einen gleich langen Vektor wieder-
+# geben, der sagt ob der Punkt im Umriss liegt:
+lies_within <- Vectorize( function( point, shape ){
+  # return TRUE if within, FALSE if not
+  x <- unlist( sf::st_within( point, shape ) )
+  if( length(x) == 0 ) return(FALSE)
+  return(TRUE)
+})
+```
+
+
+
+## Haltestellen identifizieren
+
+Wir brauchen zunächst eine Liste aller Haltestellen.
+Dafür gibt es vorbereitete Listen als öffentliche Daten zum Download, die wir beziehen.
+
+```{r}
+if( !file.exists("download/stops.txt")) {
+  download.file(STOPS_URL, "download/GTFS.zip")
+  unzip( "download/GTFS.zip", files = "stops.txt", exdir = "./download" )
+}
+```
+
+Dies ist eine (`r nrow(read.csv("download/stops.txt"))` Einträge starke) Liste, in der Haltestellennamen mit einer ID, Koordinaten und weiteren Infos stehen.
+Ein Ausschnitt der ersten 50 Einträge:
+
+```{r}
+all_stops <- read.csv("download/stops.txt")
+head(all_stops, 50) |> 
+  kbl() |> 
+  kable_styling() |> 
+  scroll_box(width="100%", height="500px")
+```
+
+### Haltestellenliste säubern
+
+Beim Betrachten kommen ein paar praktische Probleme auf, etwa: *Was ist eine Haltestelle?*
+Ist der Berliner Hauptbahnhof eine Haltestelle, oder jeder Bahnsteig?
+Oft liegt wenige Hundert Meter von einem S-Bahnhof eine Bushaltestelle mit gleichem Namen.
+Und dann sind in dieser Liste noch Orte, die weit entfernt liegen, teils sogar in anderen Ländern.
+Wir nehmen uns dieser Probleme an.
+
+```{r}
+all_stops <- read.csv("download/stops.txt") |> 
+  # wir brauchen nicht alle Spalten
+  select(stop_id,
+         stop_name,
+         stop_lat, stop_lon,
+         parent_station,
+         location_type) |> 
+  # "location_type" 0 & 1 sind Bahn- und Busstationen
+  filter( location_type < 2,
+          # Wenn es eine "parent_station" gibt, ist dies nur ein Bahnsteig oder
+          # ein weiterer Eingang, also ignorieren:
+          parent_station == ""
+  ) |> 
+  # passt die ID eines Ortes nicht in ein bestimmtes Muster, ist es wahrschein-
+  # lich keine Haltestelle oder liegt weit außerhalb Berlins:
+  filter( str_detect( stop_id, "de:[0-9]+:.*" ) ) |> 
+  # mehrteilige Halte zusammenfassen (z.B. beide Richtungen einer Bushalte):
+  mutate( single_id = str_replace( stop_id, "de:[0-9]+:([0-9]+).*", "\\1")) |> 
+  group_by(single_id) |> 
+  mutate( stop_lat = mean(stop_lat),
+          stop_lon = mean(stop_lon) ) |> 
+  slice(1) |> 
+  ungroup()
+```
+
+
+Wir haben jetzt eine `r nrow(all_stops)` Einträge starke Liste aller Bahn- und Bushaltestellen mit ihren Koordinaten, in der mehrteilige Haltestellen zu einem Punkt zusammengefasst sind.
+
+
+
+### Suchbereich eingrenzen
+
+Jetzt filtern wir alles heraus, was nicht innerhalb eines bestimmten Radius liegt.
+Zunächst durch Begrenzung auf einen Umkreis, ...
+
+```{r}
+# die Koordinaten unserer Starthaltestelle:
+departure_lat <- all_stops |> filter( str_detect( single_id, departure_id ) ) |> pull(stop_lat)
+departure_lon <- all_stops |> filter( str_detect( single_id, departure_id ) ) |> pull(stop_lon)
+
+# die Funktion "distHaversine()" gibt einen Vektor mit den Distanzen in Metern
+# für jeden Eintrag in unserer Zielliste wieder:
+goals_lonlat <- matrix( data = c( all_stops$stop_lon,
+                                  all_stops$stop_lat ),
+                        ncol = 2 )
+
+start_lonlat <- c(departure_lon, departure_lat)
+
+stops <- all_stops |>
+  # Spalte erzeugen mit Distanz:
+  mutate( distance = geosphere::distHaversine( p1 = goals_lonlat,
+                                               p2 = start_lonlat ) ) |> 
+  arrange( distance )  |> 
+  # nach Distanz filtern:
+  filter( distance <= SEARCH_RANGE ) |> 
+  # zusätzlich überflüssige Spalten entfernen:
+  select(-c(parent_station, location_type))
+
+kbl(stops) |> 
+  kable_styling() |> 
+  scroll_box(width="100%", height="500px")
+```
+
+... dann indem wir den Umriss Berlins benutzen, um alles auszuschließen, was außerhalb liegt.
+Von vornherein diesen zweiten Filter-Schritt zu machen wäre einfacher, aber rechnerisch langsamer, da für jeden der paar Tausend Punkte ein `spatial features`-Objekt angelegt werden muss, das dann auf seine Lage innerhalb des Umrisses getestet wird.
+
+```{r}
+# jedes Koordinatenpaar in einen räumlichen Punkt konvertieren:
+coords <- list()
+for(i in 1:nrow(stops) ){
+  coords[[i]] <- sf::st_point( c( stops |> slice(i) |> pull(stop_lon),
+                                  stops |> slice(i) |> pull(stop_lat) ) )
+}
+
+stops$geometry <- sf::st_sfc(coords)
+# Klasse zum Datensatz zufügen, die Geo-Operationen erlaubt,
+stops <- sf::st_as_sf(stops)
+# ... wie ein Referenzsystem festlegen
+sf::st_crs(stops$geometry) <- 4326
+
+# Umriss von Berlin als geografisch verankertes Polygon laden:
+Berlin <- geojsonsf::geojson_sfc("download/Berlin.geojson")
+sf::st_crs(Berlin) <- 4326
+# filtern:
+stops <- stops[ which( lies_within( stops$geometry, Berlin ) ),] 
+
+head(stops, 50) |> 
+  kbl() |> 
+  kable_styling() |>
+  scroll_box(width="100%", height="500px")
+```
+
+Schon ist die neue Haltestellenliste auf `r nrow(stops)` Einträge gekürzt.
+
+
+
+## Anfragen senden
+
+Als Nächstes legen wir fest, für welchen Zeitpunkt die Anfragen geschehen sollen.
+Die API akzeptiert dabei gewisse Strings:
+
+```{r echo=TRUE}
+search_time <- "next+monday+8am"
+```
+
+Mit unserer bereinigten und geografisch gefilterten Liste von Zielen, Startort und -zeit geht es an die Anfragen.
+Da es bei einem größeren Suchkreis länger dauern und etwas dazwischen kommen kann, legen wir eine Cache-Datei an.
+Wenn das Skript bereits gelaufen ist, können wir unterwegs weitermachen oder die Anfragen ganz überspringen.
+
+```{r message=T, warning=FALSE}
+if( file.exists(CACHE) ) { journey_durations <- readRDS(CACHE)
+} else { journey_durations <- integer( nrow(stops) ) }
+
+# Berechne die Reisezeiten für alle verbleibenden Einträge:
+for( i in which( journey_durations < 2 ) ) {
+  j <- bvg_request( paste0( "journeys?from=", data.frame(stops)[ 1, "single_id" ],
+                            "&to=",           data.frame(stops)[ i, "single_id" ],
+                            "&departure=",    search_time,
+                            "&results=",      "10") )
+  t <- journey_min_duration(j) |> as.integer()
+  journey_durations[i] <- t
+  message( paste0( i, ": ", data.frame(stops)[i, "stop_name"], "; ID ", data.frame(stops)[i, "single_id"], ".....", t, " minutes") )
+  # periodische Zwischenspeicherung im Cache:
+  if( i %% 10 == 0 ) saveRDS( journey_durations, CACHE )
+}
+saveRDS( journey_durations, CACHE )
+
+stops$traveltime <- journey_durations
+stops$missing_strange <- is.na(stops$traveltime) | ( stops$traveltime == 1 & stops$distance > 1200 )
+
+stops |> 
+  kbl() |> 
+  kable_styling() |>
+  scroll_box(width="100%", height="500px")
+```
+
+Voilà, die Reisezeiten für alle Haltestellen (minus einiger, bei denen die API Fehler ausgibt) sind in einer neuen Spalte gespeichert.
+
+
+
+## Extra-Infos für die Abbildung
+
+Als letzen Schritt vor der Abbildung übersetzen wir Fahrtzeiten in Säulenhöhen und erstellen eine Spalte, die den Inhalt der Tooltips repräsentiert.
+Das ist mehr Kosmetik als Datenverarbeitung, aber für die Nutzbarkeit der Darstellung immens wichtig.
+Wir schreiben nicht alle Information in die Grafik, sondern zeigen genaue Zahlen nur, wenn die Maus an entsprechender Stelle ist.
+Damit vereinen wir die Verfügbarkeit genauer Informationen mit der grafischen Gesamtschau.
+
+```{r}
+stops$elevation <- stops$traveltime * 20
+stops$tooltip <- paste0(
+  "<strong>",
+  str_replace(stops$stop_name, " \\(Berlin\\)", ""),
+  "</strong>",
+  ":<br>", stops$traveltime, " min. from S Treptower Park")
+```
+
+Das Ergebnis: Zoom, Verschieben, sowie Drehen und Neigen (Umschalt + Ziehen) sind hier möglich, um auf Regionen von Interesse zu fokussieren.
+Mit dem Mauszeiger über der Haltestelle wird die Dauer der schnellsten Verbindung angezeigt.
+
+```{r message=FALSE, warning=FALSE}
+view_lon <- mean( stops$stop_lon )
+view_lat <- mean( stops$stop_lat )
+
+mapdeck(style = mapdeck_style("dark"),
+        pitch = 50,
+        width = "100%" ) |> 
+  mapdeck::add_column(
+    data = stops,
+    fill_colour = "traveltime",
+    elevation = "elevation",
+    tooltip = "tooltip",
+    radius = 50
+  )
+  
+```
