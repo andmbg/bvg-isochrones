@@ -178,7 +178,8 @@ stops <- all_stops |>
   # zusätzlich überflüssige Spalten entfernen:
   select(-c(parent_station, location_type))
 
-kbl(stops) |> 
+head(stops) |> 
+  kbl() |> 
   kable_styling() |> 
   scroll_box(width="100%", height="500px")
 ```
@@ -250,7 +251,7 @@ saveRDS( journey_durations, CACHE )
 stops$traveltime <- journey_durations
 stops$missing_strange <- is.na(stops$traveltime) | ( stops$traveltime == 1 & stops$distance > 1200 )
 
-stops |> 
+head(stops, 50) |> 
   kbl() |> 
   kable_styling() |>
   scroll_box(width="100%", height="500px")
